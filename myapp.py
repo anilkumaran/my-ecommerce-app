@@ -1,2 +1,2 @@
 print("Welocme to Ecommerece")
-print("Today is Wed")
+print("Today is Tue")
