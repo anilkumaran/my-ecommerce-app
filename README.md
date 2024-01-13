@@ -12,3 +12,5 @@ git clone https://github.com/anilkumaran/my-ecommerce-app.git
 cd my-ecommerce-app/
 ls
 cat README.md
+
+Test commit
