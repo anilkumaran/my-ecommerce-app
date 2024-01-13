@@ -1,0 +1,38 @@
+Apache log location: /var/log/apache2
+
+export AWS_ACCESS_KEY_ID=AKIAZGIEWDBOHMDSPQGA
+export AWS_SECRET_ACCESS_KEY=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
+export AWS_DEFAULT_REGION=us-east-1
+
+
+jenkins_secret: 1c76dd26459c4be5b5636545293eab23
+
+
+Public-Private authentication
+
+private-key
+public-key
+
+
+
+server1          server2
+ubuntu1         pub
+
+pub
+pvt
+
+
+
+1M cash (LockA)
+    You
+
+key - private key/file
+
+
+LockA   public/files
+LockA
+LockA
+LockA
+LockA
+
+LockB
