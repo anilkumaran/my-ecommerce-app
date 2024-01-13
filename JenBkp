@@ -1,0 +1,50 @@
+pipeline {
+    agent {
+        node {
+            label any
+        }
+    }
+    environment {
+        APP = 'my-ecomm-app'
+    }
+    options {
+        timeout(time: 1, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '25'))
+        disableConcurrentBuilds()
+        skipDefaultCheckout()
+    }
+    stages {
+        stage('GetCode') {
+            steps {
+                deleteDir()
+
+                checkout([
+                    $class: 'GitSCM',
+                    refspec: '+refs/heads/' + env.BRANCH_NAME + ':refs/remotes/origin/' + env.BRANCH_NAME,
+                    branches: [[name: 'refs/heads/' + env.BRANCH_NAME]],
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: [[$class: 'CloneOption', depth: 10, noTags: true, honorRefspec: true, reference: '', shallow: true]],
+                    submoduleCfg: [],
+                    userRemoteConfigs: [[credentialsId: '687d61a8-a458-496e-9e06-385e4ee2474b', url: 'git@code.usnews.com:' + env.SPACE + '/' + env.APP + '.git']]
+                ])
+
+                sh '''
+                    pwd
+                    ls
+                    '''
+            }
+        }
+    }
+    post {
+        failure {
+            mail to: 'koppulaanil1786@gmail.com',
+                subject: 'FAILURE ' + env.BRANCH_NAME + ' ' + env.APP + ' Pipeline',
+                body: 'Oops something went wrong in ' + env.BRANCH_NAME
+        }
+        success {
+            mail to: 'koppulaanil1786@gmail.com',
+                subject: env.BRANCH_NAME + ' ' + env.APP + ' Pipeline',
+                body: 'Up and running with the latest changes \n\nCode Comments:\n' + sh(returnStdout: true, script: 'git log --pretty=format:%s -n 10')
+        }
+    }
+}
