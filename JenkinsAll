@@ -1,0 +1,209 @@
+regions = ['us-east-1']
+
+def outputs = [
+    sharedSecurity: [],
+    sharedNetwork: [],
+    mysqlAurora: [],
+    postgresAurora: [],
+]
+
+pipeline {
+    agent {
+        node {
+            label 'build1'
+        }
+    }
+    environment {
+        APP = 'devops'
+        SPACE = 'RepoSpace'
+        BRANCH = BRANCH_NAME.substring(9).toLowerCase()
+        BRANCH_UPPER = BRANCH.toUpperCase()
+        ENV = BRANCH_NAME.split('-')[2].toLowerCase()
+        TF_IN_AUTOMATION = 'true'
+        LAST_BUILD_FAILURE = "${currentBuild.getPreviousBuild().result != 'SUCCESS'}"
+        TF_VAR_db_lock_table_name = "terraform_state_lock-${BRANCH}"
+
+    }
+    options {
+        timeout(time: 1, unit: 'HOURS')
+        buildDiscarder(logRotator(numToKeepStr: '25'))
+        disableConcurrentBuilds()
+        skipDefaultCheckout()
+    }
+    stages {
+        stage('GetCode') {
+            steps {
+                deleteDir()
+
+                checkout([
+                    $class: 'GitSCM',
+                    refspec: '+refs/heads/' + env.BRANCH_NAME + ':refs/remotes/origin/' + env.BRANCH_NAME,
+                    branches: [[name: 'refs/heads/' + env.BRANCH_NAME]],
+                    doGenerateSubmoduleConfigurations: false,
+                    extensions: [[$class: 'CloneOption', depth: 10, noTags: true, honorRefspec: true, reference: '', shallow: true]],
+                    submoduleCfg: [],
+                    userRemoteConfigs: [[credentialsId: 'git-cred-id', url: 'git@code.usnews.com:' + env.SPACE + '/' + env.APP + '.git']]
+                ])
+            }
+        }
+        stage('SonarQubeAnalysis') {
+            when {
+                anyOf {
+                    branch 'PROD'
+                    branch 'UAT'
+                }
+            }
+            
+            steps {
+                build(
+                    job:'CodeScan',
+                    wait: false,
+                    parameters:[
+                        [$class: 'StringParameterValue', name:'APP', value:env.APP],
+                        [$class: 'StringParameterValue', name:'BRANCH', value:env.BRANCH],
+                    ]
+                )
+            }
+        }
+        stage('parallelBuilds') {
+            parallel {
+                stage('buildLambda') {
+                    steps {
+                        sh  '''#!/bin/bash
+                          . ./Lambda/build_lambda_layers.sh
+                          cd Lambda
+                          zip -qq db_backup-v${BUILD_NUMBER}.zip db_backup.py
+                          zip -qq s3-backup-v${BUILD_NUMBER}.zip se_backup.py s3_dependency.py
+
+                          # This is to make the s3 upload work, since include pattern wasn't working
+                          cd Lambda
+                          mkdir zips
+                          mv *.zip zips
+                        '''
+
+                        script {
+                            // This section uploads lambda code to S3 for CloudFormation to use
+                            regions.each { region ->
+                                withAWS(region: region) {
+                                    withCredentials([[
+                                        $class: 'AmazonWebServicesCredentialsBinding',
+                                        credentialsId: "${BRANCH_NAME.toUpperCase()}-AWS-CREDS",
+                                        accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                                        secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                                    ]]) {
+                                        s3Upload(
+                                            file:'Lambda/zips/',
+                                            bucket:'usn-' + region + '-' + env.BRANCH,
+                                            path:'Lambda/',
+
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+                stage('buildCF') {
+                    steps {
+                        // This section validates all CloudFormation templates
+
+                        withAWS(region: 'us-east-1') {
+                            withCredentials([[
+                                $class: 'AmazonWebServicesCredentialsBinding',
+                                credentialsId: env.BRANCH,
+                                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                            ]]) {
+                                script {
+                                    // upload all files for apps
+                                    s3Upload(
+                                        file:'CloudFormation/',
+                                        bucket:'repo-' + region + '-' + env.BRANCH,
+                                        path:'CloudFormation/'
+                                    )
+
+                                    // create list of files to validate
+                                    def FILES_LIST = sh(
+                                        script: '''#!/bin/bash
+                                            ls $(find CloudFormation -type f) | grep -E 'yaml|yml' | grep -v Mapping | grep -v Transform
+                                        ''',
+                                        returnStdout: true).trim()
+                                    echo FILES_LIST
+                                    // validate list of files
+                                    for (String file : FILES_LIST.split("\\r?\\n")) {
+                                        def file_url = 'https://repo-' + region + '-' + env.BRANCH + ".s3.amazonaws.com/${file}"
+                                        echo "### Validating file at url: ${file_url}"
+                                        cfnValidate(url:file_url)
+                                    }
+
+                                    cfnUpdate(
+                                        stack:'my-stack', 
+                                        file:'template.yaml', 
+                                        params:['InstanceType=t2.nano'],
+                                        keepParams:['Version'],
+                                        timeoutInMinutes:10,
+                                        tags:['TagName=Value'],
+                                        notificationARNs:['arn:aws:sns:us-east-1:993852309656:topic'],
+                                        pollInterval:1000
+                                        )
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+        stage('archiveCode') {
+            steps {
+                archiveArtifacts artifacts: 'Jenkins/*', fingerprint: true
+                archiveArtifacts artifacts: 'DockerSupport/dockersupport.tar.gz', fingerprint: true
+            }
+        }
+        stage('cleanup') {
+            when {
+                anyOf {
+                    changeset 'ExcludeFolder/**'
+                }
+            }
+
+            steps {
+                sh '''#!/bin/bash -l
+                    declare -A ACCOUNT_NO
+                    ACCOUNT_NO=( ['dev']='12344567' ['qa']='123445678' ['uat']='123445679' ['stag']='12344560' ['prod']='123445')
+
+                    echo "removing unneeded docker images"
+                    sudo docker rmi ${ACCOUNT_NO[$ENV]}.dkr.ecr.us-east-1.amazonaws.com/repo:${BRANCH}-base-stretch
+                    sudo docker rmi ${ACCOUNT_NO[$ENV]}.dkr.ecr.us-east-1.amazonaws.com/repo:${BRANCH}-base-stretch-node
+                    echo "docker images deleted"
+
+                    # Remove Cron images
+                    docker_images="$(
+                        docker images \
+                            -f "label=project=devops" \
+                            -f "label=env=${ENV}" \
+                            -f "label=build=${BUILD_NUMBER}" \
+                            -f "reference=*.dkr.ecr.us-east-1.amazonaws.com/repo:*" \
+                            --format "{{.Repository}}:{{.Tag}}"
+                    )"
+
+                    echo "Deleting docker images"
+                    for image in ${docker_images[*]}; do
+                        sudo docker rmi "$image"
+                    done
+                    '''
+            }
+        }
+    }
+    post {
+        failure {
+            mail to: 'devops@mysite.com',
+                subject: 'FAILURE ' + env.BRANCH.toUpperCase() + ' ' + env.APP + ' Pipeline',
+                body: 'Oops something went wrong in ' + env.BRANCH
+        }
+        success {
+            mail to: 'devops@mysite.com',
+                subject: env.BRANCH.toUpperCase() + ' ' + env.APP + ' Pipeline',
+                body: 'Up and running with the latest changes \n\nCode Comments:\n' + sh(returnStdout: true, script: 'git log --pretty=format:%s -n 10')
+        }
+    }
+}
